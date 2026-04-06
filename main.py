@@ -1,136 +1,138 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
-import sqlite3
-import uuid
-import os
-import threading
+from discord import app_commands, ui
+import sqlite3, uuid, os, threading, time
 from fastapi import FastAPI, Response
 import uvicorn
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 TOKEN = os.getenv("DISCORD_TOKEN")
-# Make sure to set RENDER_EXTERNAL_URL in Render Env Vars (e.g., https://bot-name.onrender.com)
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
-
 app = FastAPI()
-
-class LuarmorEngine(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=discord.Intents.all())
-    
-    async def setup_hook(self):
-        await self.tree.sync()
-        print(f"🚀 Luarmor Engine Online | Base URL: {BASE_URL}")
-
-bot = LuarmorEngine()
 
 # --- DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect("database.db")
-    # Table for Scripts/Projects
-    conn.execute('''CREATE TABLE IF NOT EXISTS projects 
-                    (project_id TEXT PRIMARY KEY, name TEXT, script_content TEXT)''')
-    # Table for Keys
-    conn.execute('''CREATE TABLE IF NOT EXISTS whitelist 
-                    (key TEXT PRIMARY KEY, project_id TEXT, hwid TEXT, status TEXT, blacklisted INTEGER DEFAULT 0)''')
+    # Project Table: Name, Script, Thumbnail
+    conn.execute("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT, script TEXT, thumb TEXT)")
+    # Whitelist Table: Key, ProjectID, HWID, DiscordID, Expiry (Unix), Banned
+    conn.execute("""CREATE TABLE IF NOT EXISTS whitelist 
+                 (key TEXT PRIMARY KEY, pid TEXT, hwid TEXT, discord_id TEXT, expiry INTEGER, banned INTEGER DEFAULT 0)""")
     conn.commit()
     conn.close()
 
-# --- PROJECT MANAGEMENT (THE PANEL SHIT) ---
+# --- BUTTON UI ---
+class LuarmorUI(ui.View):
+    def __init__(self, pid=None, name=None):
+        super().__init__(timeout=None)
+        self.pid = pid
+        self.name = name
 
-@bot.hybrid_command(name="hostscript", description="Create a new project and host a script")
-async def hostscript(ctx, name: str, script_content: str):
-    project_id = str(uuid.uuid4())[:6].lower()
+    @ui.button(label="📜 Get Script", style=discord.ButtonStyle.gray, custom_id="get_script")
+    async def get_script(self, interaction: discord.Interaction, button: ui.Button):
+        loader = f'loadstring(game:HttpGet("{BASE_URL}/load/{self.pid}"))()'
+        await interaction.response.send_message(f"**{self.name} Loader:**\n```lua\n{loader}\n```", ephemeral=True)
+
+    @ui.button(label="🔑 Redeem Key", style=discord.ButtonStyle.green, custom_id="redeem_key")
+    async def redeem(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(RedeemModal(self.pid))
+
+class RedeemModal(ui.Modal, title="Redeem Whitelist Key"):
+    key_input = ui.TextInput(label="Enter your Key", placeholder="LUA-XXXX-XXXX", required=True)
+    def __init__(self, pid):
+        super().__init__()
+        self.pid = pid
+
+    async def on_submit(self, interaction: discord.Interaction):
+        conn = sqlite3.connect("database.db")
+        cur = conn.cursor()
+        cur.execute("SELECT discord_id FROM whitelist WHERE key = ? AND pid = ?", (self.key_input.value, self.pid))
+        row = cur.fetchone()
+        if not row:
+            return await interaction.response.send_message("❌ Invalid Key!", ephemeral=True)
+        if row[0]:
+            return await interaction.response.send_message("❌ Key already linked to another user!", ephemeral=True)
+        
+        conn.execute("UPDATE whitelist SET discord_id = ? WHERE key = ?", (str(interaction.user.id), self.key_input.value))
+        conn.commit()
+        conn.close()
+        await interaction.response.send_message("✅ Key linked to your Discord successfully!", ephemeral=True)
+
+# --- BOT SETUP ---
+class LuarmorBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=discord.Intents.all())
+    async def setup_hook(self):
+        await self.tree.sync()
+        self.add_view(LuarmorUI()) # Make buttons persistent
+
+bot = LuarmorBot()
+
+# --- ADMIN COMMANDS ---
+
+@bot.tree.command(name="create_project", description="Admin: Create a new project")
+async def create_project(interaction: discord.Interaction, name: str, script: str, thumb: str = ""):
+    pid = str(uuid.uuid4())[:6]
     conn = sqlite3.connect("database.db")
-    conn.execute("INSERT INTO projects (project_id, name, script_content) VALUES (?, ?, ?)", 
-                 (project_id, name, script_content))
+    conn.execute("INSERT INTO projects VALUES (?, ?, ?, ?)", (pid, name, script, thumb))
     conn.commit()
     conn.close()
+    await interaction.response.send_message(f"✅ Project `{name}` Created! ID: `{pid}`")
+
+@bot.tree.command(name="setup_panel", description="Drop the UI Panel")
+async def setup_panel(interaction: discord.Interaction, project_id: str):
+    conn = sqlite3.connect("database.db")
+    res = conn.execute("SELECT name, thumb FROM projects WHERE id = ?", (project_id,)).fetchone()
+    conn.close()
+    if not res: return await interaction.response.send_message("❌ Project ID not found.")
     
-    loader = f'loadstring(game:HttpGet("{BASE_URL}/load/{project_id}"))()'
-    embed = discord.Embed(title="✅ Script Hosted Successfully", color=discord.Color.green())
-    embed.add_field(name="Project Name", value=name, inline=True)
-    embed.add_field(name="Project ID", value=f"`{project_id}`", inline=True)
-    embed.add_field(name="Your Loader", value=f"```lua\n{loader}\n```", inline=False)
-    await ctx.send(embed=embed)
+    embed = discord.Embed(title=f"🛡️ {res[0]} | Panel", description="Click below to manage your access.", color=0x5865f2)
+    if res[1]: embed.set_thumbnail(url=res[1])
+    await interaction.response.send_message(embed=embed, view=LuarmorUI(project_id, res[0]))
 
-@bot.hybrid_command(name="editproject", description="Change a project's name or code")
-async def editproject(ctx, project_id: str, new_name: str = None, new_script: str = None):
+@bot.tree.command(name="gen", description="Generate a Key (Days: 0 for Lifetime)")
+async def gen(interaction: discord.Interaction, project_id: str, days: int = 0):
+    key = f"LUA-{str(uuid.uuid4())[:12].upper()}"
+    expiry = 0 if days == 0 else int(time.time() + (days * 86400))
     conn = sqlite3.connect("database.db")
-    if new_name:
-        conn.execute("UPDATE projects SET name = ? WHERE project_id = ?", (new_name, project_id))
-    if new_script:
-        conn.execute("UPDATE projects SET script_content = ? WHERE project_id = ?", (new_script, project_id))
+    conn.execute("INSERT INTO whitelist VALUES (?, ?, NULL, NULL, ?, 0)", (key, project_id, expiry))
     conn.commit()
     conn.close()
-    await ctx.send(f"🛠️ Project `{project_id}` updated.")
+    await interaction.response.send_message(f"🔑 **Key:** `{key}`\n**Expiry:** {'Lifetime' if days == 0 else f'{days} Days'}", ephemeral=True)
 
-@bot.hybrid_command(name="panel", description="Display the project management menu")
-async def panel(ctx, project_id: str):
+@bot.tree.command(name="blacklist", description="Ban a key/user")
+async def blacklist(interaction: discord.Interaction, key: str):
     conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM projects WHERE project_id = ?", (project_id,))
-    res = cur.fetchone()
-    conn.close()
-    
-    if not res: return await ctx.send("❌ Project not found.")
-    
-    embed = discord.Embed(title=f"🛡️ {res[0]} Panel", color=discord.Color.blue())
-    embed.description = f"**ID:** `{project_id}`\n\nUse `/gen {project_id}` to whitelist a user.\nUse `/getscript {project_id}` for the code."
-    await ctx.send(embed=embed)
-
-# --- WHITELIST COMMANDS ---
-
-@bot.hybrid_command(name="gen", description="Generate a whitelist key for a project")
-async def gen(ctx, project_id: str):
-    new_key = f"KEY-{str(uuid.uuid4())[:8].upper()}"
-    conn = sqlite3.connect("database.db")
-    conn.execute("INSERT INTO whitelist (key, project_id, status) VALUES (?, ?, ?)", (new_key, project_id, "unused"))
+    conn.execute("UPDATE whitelist SET banned = 1 WHERE key = ?", (key,))
     conn.commit()
     conn.close()
-    await ctx.send(f"🔑 **Key Generated for `{project_id}`:** `{new_key}`")
+    await interaction.response.send_message(f"🚫 `{key}` Blacklisted.")
 
-@bot.hybrid_command(name="reset", description="Reset HWID for a user")
-async def reset(ctx, key: str):
+# --- API (ROBLOX INTERFACE) ---
+
+@app.get("/load/{pid}")
+async def load(pid: str):
     conn = sqlite3.connect("database.db")
-    conn.execute("UPDATE whitelist SET hwid = NULL WHERE key = ?", (key,))
-    conn.commit()
+    res = conn.execute("SELECT script FROM projects WHERE id = ?", (pid,)).fetchone()
     conn.close()
-    await ctx.send(f"♻️ HWID Reset for `{key}`")
-
-# --- WEB API (ROBLOX INTERACTION) ---
-
-@app.get("/load/{project_id}")
-async def fetch_script(project_id: str):
-    conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
-    cur.execute("SELECT script_content FROM projects WHERE project_id = ?", (project_id,))
-    res = cur.fetchone()
-    conn.close()
-    if res:
-        return Response(content=res[0], media_type="text/plain")
-    return Response(content="print('Error: Project not found')", media_type="text/plain")
+    return Response(content=res[0] if res else "-- Script Error", media_type="text/plain")
 
 @app.get("/verify")
-def verify(key: str, hwid: str, project_id: str):
+def verify(key: str, hwid: str, pid: str):
     conn = sqlite3.connect("database.db")
-    cur = conn.cursor()
-    cur.execute("SELECT hwid, blacklisted FROM whitelist WHERE key = ? AND project_id = ?", (key, project_id))
-    row = cur.fetchone()
-    
+    row = conn.execute("SELECT hwid, banned, expiry FROM whitelist WHERE key = ? AND pid = ?", (key, pid)).fetchone()
     if not row: return {"status": "error", "message": "invalid_key"}
-    if row[1] == 1: return {"status": "error", "message": "banned"}
+    if row[1]: return {"status": "error", "message": "blacklisted"}
+    if row[2] != 0 and time.time() > row[2]: return {"status": "error", "message": "expired"}
     
-    if row[0] is None:
-        conn.execute("UPDATE whitelist SET hwid = ?, status = 'active' WHERE key = ?", (hwid, key))
+    if not row[0]: # Bind HWID
+        conn.execute("UPDATE whitelist SET hwid = ? WHERE key = ?", (hwid, key))
         conn.commit()
-        return {"status": "success", "message": "bound"}
+        return {"status": "success", "message": "hwid_bound"}
     
-    if row[0] == hwid: return {"status": "success", "message": "verified"}
-    return {"status": "error", "message": "hwid_mismatch"}
+    return {"status": "success"} if row[0] == hwid else {"status": "error", "message": "hwid_mismatch"}
 
-# --- SERVER RUNNER ---
+# --- RUN ---
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=lambda: bot.run(TOKEN)).start()
